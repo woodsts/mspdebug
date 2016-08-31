@@ -28,6 +28,9 @@ LIBDIR = ${PREFIX}/lib/
 UNAME_S := $(shell sh -c 'uname -s')
 UNAME_O := $(shell sh -c 'uname -o 2> /dev/null')
 
+LIBUSB_CFLAGS ?= -I/usr/include/libusb-1.0
+LIBUSB_LIBS ?= -lusb-1.0
+
 ifdef WITHOUT_READLINE
 	READLINE_CFLAGS =
 	READLINE_LIBS =
@@ -66,16 +69,16 @@ else
 
     ifeq ($(UNAME_S),Darwin) # Mac OS X/MacPorts stuff
       ifeq ($(shell fink -V > /dev/null 2>&1 && echo ok),ok)
-	PORTS_CFLAGS := $(shell pkg-config --cflags libusb)
-	PORTS_LDFLAGS := $(shell pkg-config --libs libusb) -ltermcap -pthread
+	PORTS_CFLAGS := $(shell pkg-config --cflags libusb-1.0)
+	PORTS_LDFLAGS := $(shell pkg-config --libs libusb-1.0) -ltermcap -pthread
       else
 	PORTS_CFLAGS := -I/opt/local/include
 	PORTS_LDFLAGS := -L/opt/local/lib -framework IOKit -framework CoreFoundation
       endif
       BSLHID_OBJ = transport/bslosx.o
     else ifneq ($(filter $(UNAME_S),OpenBSD NetBSD DragonFly),)
-	PORTS_CFLAGS := $(shell pkg-config --cflags libusb)
-	PORTS_LDFLAGS := $(shell pkg-config --libs libusb) -ltermcap -pthread
+	PORTS_CFLAGS := $(shell pkg-config --cflags libusb-1.0)
+	PORTS_LDFLAGS := $(shell pkg-config --libs libusb-1.0) -ltermcap -pthread
     else
 	PORTS_CFLAGS :=
 	PORTS_LDFLAGS :=
@@ -87,8 +90,8 @@ GCC_CFLAGS = -O1 -Wall -Wno-char-subscripts -ggdb
 CONFIG_CFLAGS = -DLIB_DIR=\"$(LIBDIR)\"
 
 MSPDEBUG_LDFLAGS = $(LDFLAGS) $(PORTS_LDFLAGS)
-MSPDEBUG_LIBS = -L. -lusb $(READLINE_LIBS) $(OS_LIBS)
-MSPDEBUG_CFLAGS = $(CFLAGS) $(READLINE_CFLAGS) $(PORTS_CFLAGS)\
+MSPDEBUG_LIBS = $(LIBUSB_LIBS) $(READLINE_LIBS) $(OS_LIBS)
+MSPDEBUG_CFLAGS = $(CFLAGS) $(LIBUSB_CFLAGS) $(READLINE_CFLAGS) $(PORTS_CFLAGS)\
  $(GCC_CFLAGS) $(INCLUDES) $(CONFIG_CFLAGS) $(OS_CFLAGS)
 
 all: $(BINARY)

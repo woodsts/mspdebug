@@ -45,107 +45,130 @@ struct bslhid_transport {
 	int				cfg_number;
 	int				int_number;
 
-	struct usb_dev_handle		*handle;
+	struct libusb_device_handle	*handle;
 
 	int				in_ep;
 	int				out_ep;
 
-	char				bus_name[PATH_MAX + 1];
+	char				path[8];
+	char				serial[128];
 };
 
 static int find_interface(struct bslhid_transport *tr,
-			  const struct usb_device *dev)
+			  const struct libusb_device *dev)
 {
-	int c;
+	int i;
+	struct libusb_config_descriptor *c;
+	int rc = libusb_get_config_descriptor((struct libusb_device *)dev, 0, &c);
 
-	for (c = 0; c < dev->descriptor.bNumConfigurations; c++) {
-		const struct usb_config_descriptor *cfg = &dev->config[c];
-		int i;
+	if (rc != 0) {
+		printc_err("bslhid: can't get configuration: %s\n",
+			   libusb_strerror(rc));
+		return -1;
+	}
 
-		for (i = 0; i < cfg->bNumInterfaces; i++) {
-			const struct usb_interface *intf = &cfg->interface[i];
-			const struct usb_interface_descriptor *desc =
-				&intf->altsetting[0];
+	for (i = 0; i < c->bNumInterfaces; i++) {
+		const struct libusb_interface *intf = &c->interface[i];
+		const struct libusb_interface_descriptor *desc = &intf->altsetting[0];
+		int j;
 
-			if (desc->bInterfaceClass == BSLHID_CLASS) {
-				tr->cfg_number = c;
-				tr->int_number = i;
-				return 0;
-			}
+		if (desc->bInterfaceClass != BSLHID_CLASS)
+			continue;
+
+		/* Look for bulk in/out endpoints */
+		tr->in_ep = -1;
+		tr->out_ep = -1;
+
+		for (j = 0; j < desc->bNumEndpoints; j++) {
+			const struct libusb_endpoint_descriptor *ep =
+				&desc->endpoint[j];
+			const int type =
+				ep->bmAttributes & USB_ENDPOINT_TYPE_MASK;
+			const int addr = ep->bEndpointAddress;
+
+			if (type != USB_ENDPOINT_TYPE_BULK)
+				continue;
+
+			if (addr & USB_ENDPOINT_DIR_MASK)
+				tr->in_ep = addr;
+			else
+				tr->out_ep = addr;
 		}
+
+		if (tr->in_ep >= 0 && tr->out_ep >= 0) {
+			tr->cfg_number = c->bConfigurationValue;
+			tr->int_number = i;
+			printc_dbg("Opening interface %d (config %d)...\n",
+				   tr->int_number, tr->cfg_number);
+			printc_dbg("Found endpoints: IN: 0x%02x, OUT: 0x%02x\n",
+				   tr->in_ep, tr->out_ep);
+			return 0;
+		}
+
+		printc_err("bslhid: can't find suitable endpoints\n");
 	}
 
 	printc_err("bslhid: can't find a matching interface\n");
+
 	return -1;
 }
 
-static int find_endpoints(struct bslhid_transport *tr,
-			  const struct usb_device *dev)
+static int open_device(struct bslhid_transport *tr, struct libusb_device *dev)
 {
-	const struct usb_interface_descriptor *desc =
-		&dev->config[tr->cfg_number].interface[tr->int_number].
-			altsetting[0];
-	int i;
+	struct libusb_device_descriptor desc;
+	int rc = libusb_get_device_descriptor(dev, &desc);
 
-	tr->in_ep = -1;
-	tr->out_ep = -1;
-
-	for (i = 0; i < desc->bNumEndpoints; i++) {
-		int addr = desc->endpoint[i].bEndpointAddress;
-
-		if (addr & USB_ENDPOINT_DIR_MASK)
-			tr->in_ep = addr;
-		else
-			tr->out_ep = addr;
-	}
-
-	if (tr->in_ep < 0 || tr->out_ep < 0) {
-		printc_err("bslhid: can't find suitable endpoints\n");
+	if (rc != 0) {
+		printc_err("bslhid: can't get device descriptor: %s\n",
+			   libusb_strerror(rc));
 		return -1;
 	}
 
-	return 0;
-}
-
-static int open_device(struct bslhid_transport *tr, struct usb_device *dev)
-{
-	if (find_interface(tr, dev) < 0)
+	if (find_interface(tr, dev) != 0) {
 		return -1;
+	}
 
-	printc_dbg("Opening interface %d (config %d)...\n",
-		   tr->int_number, tr->cfg_number);
+	printc_dbg("bslhid: Trying to open interface %d on %03d:%03d %04x:%04x\n",
+		   tr->int_number,
+		   libusb_get_bus_number(dev), libusb_get_device_address(dev),
+		   desc.idVendor, desc.idProduct);
 
-	if (find_endpoints(tr, dev) < 0)
-		return -1;
-
-	printc_dbg("Found endpoints: IN: 0x%02x, OUT: 0x%02x\n",
-		   tr->in_ep, tr->out_ep);
-
-	tr->handle = usb_open(dev);
+	rc = libusb_open(dev, &tr->handle);
 	if (!tr->handle) {
-		pr_error("bslhid: can't open device");
+		printc_err("bslhid: can't open device: %s\n",
+			   libusb_strerror(rc));
 		return -1;
 	}
-
-#ifdef __Windows__
-	if (usb_set_configuration(tr->handle, tr->cfg_number) < 0)
-		pr_error("warning: bslhid: can't set configuration");
-#endif
 
 #ifdef __linux__
-	if (usb_detach_kernel_driver_np(tr->handle, tr->int_number) < 0)
-		pr_error("warning: bslhid: can't detach kernel driver");
+	if (libusb_kernel_driver_active(tr->handle, tr->int_number) == 1) {
+		printc_dbg("bslhid: Detaching kernel driver for %03d:%03d %04x:%04x\n",
+			   libusb_get_bus_number(dev), libusb_get_device_address(dev),
+			   desc.idVendor, desc.idProduct);
+		rc = libusb_detach_kernel_driver(tr->handle, tr->int_number);
+		if (rc != 0)
+			printc_err("bslhid: warning: can't detach kernel driver: %s\n",
+				   libusb_strerror(rc));
+	}
 #endif
 
-	if (usb_claim_interface(tr->handle, tr->int_number) < 0) {
-		pr_error("bslhid: can't claim interface");
-		usb_close(tr->handle);
+#ifdef __Windows__
+	rc = libusb_set_configuration(tr->handle, tr->cfg_number);
+	if (rc != 0) {
+		printc_err("bslhid: can't set configuration: %s\n",
+			   libusb_strerror(rc));
+		libusb_close(tr->handle);
 		return -1;
 	}
+#endif
 
-	/* Save the bus path for a future suspend/resume */
-	strncpy(tr->bus_name, dev->bus->dirname, sizeof(tr->bus_name));
-	tr->bus_name[sizeof(tr->bus_name) - 1] = 0;
+	rc = libusb_claim_interface(tr->handle, tr->int_number);
+	if (rc != 0) {
+		printc_err("ftdi: can't claim interface: %s\n",
+			   libusb_strerror(rc));
+		libusb_close(tr->handle);
+		return -1;
+	}
 
 	return 0;
 }
@@ -154,12 +177,14 @@ static void bslhid_destroy(transport_t base)
 {
 	struct bslhid_transport *tr = (struct bslhid_transport *)base;
 
-	if (tr->handle) {
-		usb_release_interface(tr->handle, tr->int_number);
-		usb_close(tr->handle);
+	if (tr) {
+		if (tr->handle) {
+			libusb_release_interface(tr->handle, tr->int_number);
+			libusb_unref_device(libusb_get_device(tr->handle));
+			libusb_close(tr->handle);
+		}
+		free(tr);
 	}
-
-	free(tr);
 }
 
 static int bslhid_flush(transport_t base)
@@ -167,12 +192,15 @@ static int bslhid_flush(transport_t base)
 #ifndef __APPLE__
 	struct bslhid_transport *tr = (struct bslhid_transport *)base;
 	uint8_t inbuf[BSLHID_XFER_SIZE];
+	int received;
 
 	if (!tr->handle)
 		return 0;
 
-	while (usb_bulk_read(tr->handle, tr->in_ep,
-			     (char *)inbuf, sizeof(inbuf), 100) > 0);
+	/* Flush out lingering data */
+	while (libusb_bulk_transfer(tr->handle, tr->in_ep,
+			     inbuf, sizeof(inbuf),
+			     &received, 100) != 0);
 #endif
 
 	return 0;
@@ -182,6 +210,8 @@ static int bslhid_send(transport_t base, const uint8_t *data, int len)
 {
 	struct bslhid_transport *tr = (struct bslhid_transport *)base;
 	uint8_t outbuf[BSLHID_XFER_SIZE];
+	int rc;
+	int sent;
 
 	if (!tr->handle) {
 		printc_err("bslhid: send on suspended device\n");
@@ -203,11 +233,17 @@ static int bslhid_send(transport_t base, const uint8_t *data, int len)
 	debug_hexdump("bslhid_send", outbuf, sizeof(outbuf));
 #endif
 
-	if (usb_bulk_write(tr->handle, tr->out_ep,
-			   (char *)outbuf, sizeof(outbuf),
-			   BSLHID_TIMEOUT) < 0) {
-		printc_err("bslhid: usb_bulk_write: %s\n", usb_strerror());
-		return -1;
+	while (len) {
+		rc = libusb_bulk_transfer(tr->handle, tr->out_ep,
+				      (unsigned char *)data, len, &sent,
+				      BSLHID_TIMEOUT);
+		if ((rc != 0) && (rc != LIBUSB_ERROR_TIMEOUT)) {
+			pr_error("bslhid: can't send data");
+			return -1;
+		}
+
+		data += sent;
+		len -= sent;
 	}
 
 	return 0;
@@ -217,6 +253,7 @@ static int bslhid_recv(transport_t base, uint8_t *data, int max_len)
 {
 	struct bslhid_transport *tr = (struct bslhid_transport *)base;
 	uint8_t inbuf[BSLHID_XFER_SIZE];
+	int rc;
 	int r;
 	int len;
 
@@ -225,10 +262,10 @@ static int bslhid_recv(transport_t base, uint8_t *data, int max_len)
 		return -1;
 	}
 
-	r = usb_bulk_read(tr->handle, tr->in_ep,
-			  (char *)inbuf, sizeof(inbuf), BSLHID_TIMEOUT);
-	if (r <= 0) {
-		printc_err("bslhid_recv: usb_bulk_read: %s\n", usb_strerror());
+	rc = libusb_bulk_transfer(tr->handle, tr->in_ep,
+			  (unsigned char *)inbuf, sizeof(inbuf), &r, BSLHID_TIMEOUT);
+	if ((rc != 0) && (rc != LIBUSB_ERROR_TIMEOUT)) {
+		printc_err("bslhid_recv: usb_bulk_read: %s\n", libusb_strerror(rc));
 		return -1;
 	}
 
@@ -254,12 +291,14 @@ static int bslhid_recv(transport_t base, uint8_t *data, int max_len)
 	}
 
 	memcpy(data, inbuf + 2, len);
+
 	return len;
 }
 
 static int bslhid_set_modem(transport_t base, transport_modem_t state)
 {
 	printc_err("bslhid: unsupported operation: set_modem\n");
+
 	return -1;
 }
 
@@ -268,62 +307,27 @@ static int bslhid_suspend(transport_t base)
 	struct bslhid_transport *tr = (struct bslhid_transport *)base;
 
 	if (tr->handle) {
-		usb_release_interface(tr->handle, tr->int_number);
-		usb_close(tr->handle);
+		libusb_release_interface(tr->handle, tr->int_number);
+		libusb_close(tr->handle);
 		tr->handle = NULL;
 	}
 
 	return 0;
 }
 
-static struct usb_bus *find_by_name(const char *name)
-{
-	struct usb_bus *b;
-
-	for (b = usb_get_busses(); b; b = b->next)
-		if (!strcmp(name, b->dirname))
-			return b;
-
-	return NULL;
-}
-
-static struct usb_device *find_first_bsl(struct usb_bus *bus)
-{
-	struct usb_device *d;
-
-	for (d = bus->devices; d; d = d->next)
-		if ((d->descriptor.idVendor == BSLHID_VID) &&
-		    (d->descriptor.idProduct == BSLHID_PID))
-			return d;
-
-	return NULL;
-}
-
 static int bslhid_resume(transport_t base)
 {
 	struct bslhid_transport *tr = (struct bslhid_transport *)base;
-	struct usb_bus *bus;
-	struct usb_device *dev;
+	struct libusb_device *dev;
 
 	if (tr->handle)
 		return 0;
 
-	usb_init();
-	usb_find_busses();
-	usb_find_devices();
+	libusb_init(NULL);
 
-	bus = find_by_name(tr->bus_name);
-	if (!bus) {
-		printc_err("bslhid: can't find bus to resume from\n");
-		return -1;
-	}
-
-	/* We can't portably distinguish physical locations, so this
-	 * will have to do.
-	 */
-	dev = find_first_bsl(bus);
+	dev = usbutil_find_by_loc((const char *)tr->path);
 	if (!dev) {
-		printc_err("bslhid: can't find a BSL HID on this bus\n");
+		printc_err("bslhid: failed to find BSL HID device on resume\n");
 		return -1;
 	}
 
@@ -348,7 +352,8 @@ static const struct transport_class bslhid_transport_class = {
 transport_t bslhid_open(const char *dev_path, const char *requested_serial)
 {
 	struct bslhid_transport *tr = malloc(sizeof(*tr));
-	struct usb_device *dev;
+	struct libusb_device *dev;
+	unsigned int len;
 
 	if (!tr) {
 		pr_error("bslhid: can't allocate memory");
@@ -356,17 +361,27 @@ transport_t bslhid_open(const char *dev_path, const char *requested_serial)
 	}
 
 	memset(tr, 0, sizeof(*tr));
+
 	tr->base.ops = &bslhid_transport_class;
 
-	usb_init();
-	usb_find_busses();
-	usb_find_devices();
+	libusb_init(NULL);
 
-	if (dev_path)
+	if (dev_path) {
+		len = strlen(dev_path);
+		memset(tr->serial, 0, sizeof(tr->serial));
+		memcpy(tr->path, dev_path,
+		       len < sizeof(tr->path) ?
+		       len : (sizeof(tr->path) - 1));
 		dev = usbutil_find_by_loc(dev_path);
-	else
+	} else {
+		len = strlen(requested_serial);
+		memset(tr->path, 0, sizeof(tr->path));
+		memcpy(tr->serial, requested_serial,
+		       len < sizeof(tr->serial) ?
+		       len : (sizeof(tr->serial) - 1));
 		dev = usbutil_find_by_id(BSLHID_VID, BSLHID_PID,
 					 requested_serial);
+	}
 
 	if (!dev) {
 		free(tr);
@@ -380,5 +395,6 @@ transport_t bslhid_open(const char *dev_path, const char *requested_serial)
 	}
 
 	bslhid_flush(&tr->base);
+
 	return &tr->base;
 }

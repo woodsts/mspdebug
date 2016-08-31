@@ -31,14 +31,14 @@
 #include "output.h"
 
 struct rf2500_transport {
-	struct transport        base;
+	struct transport            base;
 
-	int                     int_number;
-	struct usb_dev_handle   *handle;
+	int                         int_number;
+	struct libusb_device_handle *handle;
 
-	uint8_t                 buf[64];
-	int                     len;
-	int                     offset;
+	uint8_t                     buf[64];
+	int                         len;
+	int                         offset;
 };
 
 /*********************************************************************
@@ -60,35 +60,50 @@ struct rf2500_transport {
 #define USB_FET_OUT_EP			0x01
 
 static int open_interface(struct rf2500_transport *tr,
-			  struct usb_device *dev, int ino)
+			  struct libusb_device *dev, int ino)
 {
-	printc_dbg("Trying to open interface %d on %s\n", ino, dev->filename);
+	int rc;
+
+	printc_dbg("rf2500: Trying to open interface %d on %03d:%03d\n",
+		   ino,
+		   libusb_get_bus_number(dev), libusb_get_device_address(dev));
 
 	tr->int_number = ino;
 
-	tr->handle = usb_open(dev);
+	rc = libusb_open(dev, &tr->handle);
 	if (!tr->handle) {
-		pr_error("rf2500: can't open device");
+		printc_err("rf2500: can't open device: %s\n",
+			   libusb_strerror(rc));
 		return -1;
 	}
 
 #if defined(__linux__)
-	if (usb_detach_kernel_driver_np(tr->handle, tr->int_number) < 0)
-		pr_error("rf2500: warning: can't "
-			"detach kernel driver");
+	if (libusb_kernel_driver_active(tr->handle, tr->int_number) == 1) {
+		printc_dbg("rf2500: Detaching kernel driver for %03d:%03d\n",
+			   libusb_get_bus_number(dev),
+			   libusb_get_device_address(dev));
+		rc = libusb_detach_kernel_driver(tr->handle, tr->int_number);
+		if (rc != 0)
+			printc_err("rf2500: warning: can't detach kernel "
+				   "driver: %s", libusb_strerror(rc));
+	}
 #endif
 
 #ifdef __Windows__
-	if (usb_set_configuration(tr->handle, 1) < 0) {
-		pr_error("rf2500: can't set configuration 1");
-		usb_close(tr->handle);
+	rc = libusb_set_configuration(tr->handle, 1);
+	if (rc != 0) {
+		printc_err("rf2500: can't set configuration: %s\n",
+			   libusb_strerror(rc));
+		libusb_close(tr->handle);
 		return -1;
 	}
 #endif
 
-	if (usb_claim_interface(tr->handle, tr->int_number) < 0) {
-		pr_error("rf2500: can't claim interface");
-		usb_close(tr->handle);
+	rc = libusb_claim_interface(tr->handle, tr->int_number);
+	if (rc != 0) {
+		printc_err("rf2500: can't claim interface: %s\n",
+			   libusb_strerror(rc));
+		libusb_close(tr->handle);
 		return -1;
 	}
 
@@ -96,14 +111,21 @@ static int open_interface(struct rf2500_transport *tr,
 }
 
 static int open_device(struct rf2500_transport *tr,
-		       struct usb_device *dev)
+		       struct libusb_device *dev)
 {
-	struct usb_config_descriptor *c = &dev->config[0];
 	int i;
+	struct libusb_config_descriptor *c;
+	int rc = libusb_get_config_descriptor(dev, 0, &c);
+
+	if (rc != 0) {
+		printc_err("rf2500: can't get configuration: %s\n",
+			   libusb_strerror(rc));
+		return -1;
+	}
 
 	for (i = 0; i < c->bNumInterfaces; i++) {
-		struct usb_interface *intf = &c->interface[i];
-		struct usb_interface_descriptor *desc = &intf->altsetting[0];
+		const struct libusb_interface *intf = &c->interface[i];
+		const struct libusb_interface_descriptor *desc = &intf->altsetting[0];
 
 		if (desc->bInterfaceClass == USB_FET_INTERFACE_CLASS &&
 		    !open_interface(tr, dev, desc->bInterfaceNumber))
@@ -116,8 +138,9 @@ static int open_device(struct rf2500_transport *tr,
 static int usbtr_send(transport_t tr_base, const uint8_t *data, int len)
 {
 	struct rf2500_transport *tr = (struct rf2500_transport *)tr_base;
+	int rc;
 
-	while (len) {
+	while (len > 0) {
 		uint8_t pbuf[256];
 		int plen = len > 255 ? 255 : len;
 		int txlen = plen + 1;
@@ -138,8 +161,9 @@ static int usbtr_send(transport_t tr_base, const uint8_t *data, int len)
 #ifdef DEBUG_USBTR
 		debug_hexdump("USB transfer out", pbuf, txlen);
 #endif
-		if (usb_bulk_write(tr->handle, USB_FET_OUT_EP,
-			(char *)pbuf, txlen, 10000) < 0) {
+		rc = libusb_bulk_transfer(tr->handle, USB_FET_OUT_EP,
+			(unsigned char *)pbuf, txlen, &plen, 10000);
+		if ((rc != 0) && (rc != LIBUSB_ERROR_TIMEOUT)) {
 			pr_error("rf2500: can't send data");
 			return -1;
 		}
@@ -154,12 +178,15 @@ static int usbtr_send(transport_t tr_base, const uint8_t *data, int len)
 static int usbtr_recv(transport_t tr_base, uint8_t *databuf, int max_len)
 {
 	struct rf2500_transport *tr = (struct rf2500_transport *)tr_base;
+	int rc;
 	int rlen;
+	int received;
 
 	if (tr->offset >= tr->len) {
-		if (usb_bulk_read(tr->handle, USB_FET_IN_EP,
-				(char *)tr->buf, sizeof(tr->buf),
-				10000) < 0) {
+		rc = libusb_bulk_transfer(tr->handle, USB_FET_IN_EP,
+				(unsigned char *)tr->buf, sizeof(tr->buf),
+				&received, 10000);
+		if ((rc != 0) && (rc != LIBUSB_ERROR_TIMEOUT)) {
 			pr_error("rf2500: can't receive data");
 			return -1;
 		}
@@ -187,8 +214,9 @@ static void usbtr_destroy(transport_t tr_base)
 {
 	struct rf2500_transport *tr = (struct rf2500_transport *)tr_base;
 
-	usb_release_interface(tr->handle, tr->int_number);
-	usb_close(tr->handle);
+	libusb_release_interface(tr->handle, tr->int_number);
+	libusb_unref_device(libusb_get_device(tr->handle));
+	libusb_close(tr->handle);
 	free(tr);
 }
 
@@ -197,16 +225,17 @@ static int usbtr_flush(transport_t tr_base)
 	struct rf2500_transport *tr = (struct rf2500_transport *)tr_base;
 
 #if !defined(__APPLE__) && !defined(__sun__)
-	char buf[64];
+	int received;
+	unsigned char buf[64];
 
 	/* Flush out lingering data.
 	 *
 	 * The timeout apparently doesn't work on OS/X, and this loop
 	 * just hangs once the endpoint buffer empties.
-	 */
-	while (usb_bulk_read(tr->handle, USB_FET_IN_EP,
-			     buf, sizeof(buf),
-			     100) > 0);
+	 */	
+	while (libusb_bulk_transfer(tr->handle, USB_FET_IN_EP,
+				    buf, sizeof(buf),
+				    &received, 100) != 0);
 #endif
 
 	tr->len = 0;
@@ -231,7 +260,7 @@ static const struct transport_class rf2500_transport = {
 transport_t rf2500_open(const char *devpath, const char *requested_serial)
 {
 	struct rf2500_transport *tr = malloc(sizeof(*tr));
-	struct usb_device *dev;
+	struct libusb_device *dev;
 
 	if (!tr) {
 		pr_error("rf2500: can't allocate memory");
@@ -241,9 +270,7 @@ transport_t rf2500_open(const char *devpath, const char *requested_serial)
 	memset(tr, 0, sizeof(*tr));
 	tr->base.ops = &rf2500_transport;
 
-	usb_init();
-	usb_find_busses();
-	usb_find_devices();
+	libusb_init(NULL);
 
 	if (devpath)
 		dev = usbutil_find_by_loc(devpath);
@@ -262,7 +289,7 @@ transport_t rf2500_open(const char *devpath, const char *requested_serial)
 		return NULL;
 	}
 
-	usbtr_flush(&tr->base);
+	usbtr_flush((transport_t)tr);
 
 	return (transport_t)tr;
 }

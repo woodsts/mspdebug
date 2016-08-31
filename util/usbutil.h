@@ -20,7 +20,7 @@
 #define USBUTIL_H_
 
 #ifndef __Windows__
-#include <usb.h>
+#include <libusb.h>
 #else
 #include <lusb0_usb.h>
 #endif
@@ -29,10 +29,10 @@
 void usbutil_list(void);
 
 /* Search for the first device matching the given Vendor:Product */
-struct usb_device *usbutil_find_by_id(int vendor, int product,
+struct libusb_device *usbutil_find_by_id(int vendor, int product,
 				      const char *requested_serial);
 
 /* Search for a device using a bus:dev location string */
-struct usb_device *usbutil_find_by_loc(const char *loc);
+struct libusb_device *usbutil_find_by_loc(const char *loc);
 
 #endif
